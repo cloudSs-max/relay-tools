@@ -25,7 +25,7 @@ HOW IT WORKS
   Latency:                     ~300-700ms  (usable for interactive SSH)
 """
 
-import sys, os, time, json, socket, threading, base64, zlib, argparse, queue
+import sys, os, time, json, socket, threading, base64, zlib, argparse, queue, select, struct
 import urllib.request, urllib.error, ssl
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -35,7 +35,7 @@ POLL_SEC      = 0.15       # seconds between polls  (150ms)
 LOCAL_SSH     = 22         # sshd port on Iranian server
 CLIENT_PORT   = 2222       # local port exposed on Sohrab's machine
 API_HOST      = "api.github.com"
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 
 CTX = ssl.create_default_context()
 
@@ -323,21 +323,112 @@ def run_client(token, port):
     print("[client] Session ended.")
 
 
+# ── Built-in SOCKS5 proxy server ──────────────────────────────────────────────
+
+def _socks5_client(conn):
+    """Handle one SOCKS5 client — runs in its own daemon thread."""
+    try:
+        # Greeting: read version + nmethods
+        head = conn.recv(2)
+        nmethods = head[1]
+        conn.recv(nmethods)            # consume offered auth methods
+        conn.send(b'\x05\x00')         # select: no authentication
+
+        # Request
+        req  = conn.recv(4)
+        cmd  = req[1]
+        atyp = req[3]
+
+        if   atyp == 0x01:             # IPv4
+            addr = socket.inet_ntoa(conn.recv(4))
+        elif atyp == 0x03:             # domain name
+            n    = conn.recv(1)[0]
+            addr = conn.recv(n).decode()
+        elif atyp == 0x04:             # IPv6
+            addr = socket.inet_ntop(socket.AF_INET6, conn.recv(16))
+        else:
+            return
+
+        port = struct.unpack('!H', conn.recv(2))[0]
+
+        if cmd != 0x01:                # only CONNECT is supported
+            conn.send(b'\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00')
+            return
+
+        # Open upstream TCP connection
+        try:
+            up  = socket.create_connection((addr, port), timeout=20)
+            bnd = up.getsockname()
+            conn.send(b'\x05\x00\x00\x01'
+                      + socket.inet_aton(bnd[0])
+                      + struct.pack('!H', bnd[1]))
+        except OSError:
+            conn.send(b'\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00')
+            return
+
+        # Relay bytes until one side closes
+        pair = [conn, up]
+        while True:
+            r, _, x = select.select(pair, [], pair, 120)
+            if x or not r:
+                break
+            for s in r:
+                data = s.recv(8192)
+                if not data:
+                    return
+                (up if s is conn else conn).sendall(data)
+
+    except Exception:
+        pass
+    finally:
+        try: conn.close()
+        except: pass
+
+
+def run_socks5(port):
+    """
+    Tiny SOCKS5 proxy server — pure stdlib, no auth, CONNECT only.
+    Useful as a gateway: run this on the Windows/outside machine, then
+    expose it to the Iranian server via SSH reverse tunnel:
+        ssh -R 3128:127.0.0.1:<port> -N -tt -p 2222 root@localhost
+    Iranian server can then curl --socks5 localhost:3128 https://...
+    """
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(('127.0.0.1', port))
+    srv.listen(128)
+    print("=" * 55)
+    print("  Built-in SOCKS5 Proxy  —  GATEWAY MODE")
+    print("=" * 55)
+    print(f"  Listening : 127.0.0.1:{port}")
+    print()
+    print("  To expose this proxy to the Iranian server, run:")
+    print(f"    ssh -R 3128:127.0.0.1:{port} -N -tt -p 2222 root@localhost")
+    print()
+    print("  On the Iranian server, use the proxy with:")
+    print("    export ALL_PROXY=socks5://127.0.0.1:3128")
+    print("    curl --socks5 localhost:3128 https://google.com")
+    print()
+    while True:
+        conn, _ = srv.accept()
+        threading.Thread(target=_socks5_client, args=(conn,), daemon=True).start()
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
         description="SSH tunnel via GitHub API — works through Iran's firewall"
     )
-    ap.add_argument("mode",    choices=["server", "client"],
-                    help="server = run on Iranian VPS  |  client = run on your machine")
+    ap.add_argument("mode",    choices=["server", "client", "socks5"],
+                    help="server = run on Iranian VPS  |  client = run on your machine  |  socks5 = run local SOCKS5 gateway")
     ap.add_argument("--token", default=os.environ.get("GITHUB_TOKEN", ""),
                     help="GitHub Personal Access Token (repo scope)")
     ap.add_argument("--port",  type=int, default=CLIENT_PORT,
                     help=f"local port for SSH (client mode, default {CLIENT_PORT})")
     args = ap.parse_args()
 
-    if not args.token:
+    if not args.token and args.mode != "socks5":
         print("ERROR: provide --token or set GITHUB_TOKEN env var")
         print("  Get token at: https://github.com/settings/tokens")
         print("  Scopes needed: repo (read+write)")
@@ -345,5 +436,7 @@ if __name__ == "__main__":
 
     if args.mode == "server":
         run_server(args.token)
-    else:
+    elif args.mode == "client":
         run_client(args.token, args.port)
+    else:  # socks5
+        run_socks5(args.port)
