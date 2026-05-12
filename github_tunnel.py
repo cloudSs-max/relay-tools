@@ -35,7 +35,7 @@ POLL_SEC      = 0.15       # seconds between polls  (150ms)
 LOCAL_SSH     = 22         # sshd port on Iranian server
 CLIENT_PORT   = 2222       # local port exposed on Sohrab's machine
 API_HOST      = "api.github.com"
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 CTX = ssl.create_default_context()
 
@@ -144,7 +144,7 @@ class Channel:
                 with self._lock:
                     self._sha = resp.get("content", {}).get("sha")
                 return True
-            if code == 409:              # conflict: re-fetch SHA and retry
+            if code in (409, 422):       # conflict or missing sha → re-fetch and retry
                 self._refresh_sha()
                 body["sha"] = self._sha
             time.sleep(0.3 * (attempt + 1))
@@ -249,7 +249,11 @@ def run_server(token):
 
     # Signal ready to client
     print("[server] Signaling READY to GitHub...")
-    s2c.write(b"READY")
+    s2c._refresh_sha()          # pre-fetch SHA so first write succeeds
+    ok = s2c.write(b"READY")
+    if not ok:
+        print("[server] ERROR: failed to write READY — check token/network")
+        sys.exit(1)
     print("[server] Waiting for client to connect...")
 
     while True:
